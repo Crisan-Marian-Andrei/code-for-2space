@@ -1,5 +1,5 @@
 idf_component_register(
     SRCS "bus_manager.c"
-    INCLUDE_DIRS "."
-    REQUIRES driver
+    INCLUDE_DIRS "include"
+    REQUIRES driver board_bsp
 )
