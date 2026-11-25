@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "flight_fsm.c"
+    SRCS "flight_fsm.c" "state_estimator.c"
     INCLUDE_DIRS "."
-    REQUIRES driver esp_adc esp_timer imu_baro
+    REQUIRES esp_timer
 )

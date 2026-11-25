@@ -1,189 +1,272 @@
+// 2SPACE rocket avionics firmware entry point (ESP32-S3). See README.md.
 #include <stdio.h>
-#include <stdbool.h>
 #include <string.h>
+#include <stdbool.h>
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "driver/spi_master.h"
-#include "driver/gpio.h"
+#include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_wifi.h"
+#include "nvs_flash.h"
 
-#include "sd_logger.h"
+#include "board_pins.h"
+#include "bus_manager.h"
 #include "ads124s06.h"
+#include "imu_baro.h"
+#include "gnss.h"
+#include "lora.h"
+#include "sd_logger.h"
 #include "state_estimator.h"
+#include "flight_fsm.h"
 
-static const char *TAG = "MAIN_FLIGHT";
+static const char *TAG = "MAIN";
 
-// Pinii pentru SPI-ul comun (ADS124S06 + Ra-01H LoRa)
-#define SPI_HOST_USED   SPI2_HOST
-#define PIN_SPI_MOSI    11
-#define PIN_SPI_SCK     12
-#define PIN_SPI_MISO    13
-#define PIN_LORA_CS     10
+#define ADC_GAIN_CODE        ADS124_GAIN_64
+#define ADC_GAIN_MULTIPLIER  64.0f
 
-#define LOOP_PERIOD_MS  20  // 50 Hz -> destul timp pentru ADC + IMU + baro
+#define SENSOR_LOOP_MS       20          // 50 Hz
 
-typedef enum {
-    STATE_PAD_IDLE = 0,
-    STATE_FLIGHT   = 1,
-    STATE_LANDED   = 2
-} flight_state_t;
+#define LORA_PERIOD_FLIGHT_MS  200
+#define LORA_PERIOD_PAD_MS     1000
 
-static bool s_adc_ready = false;
+// Shared data between tasks; take s_data_mutex before touching these.
+static SemaphoreHandle_t s_data_mutex = NULL;
 
-// Date dummy pana legam driverul real de IMU + baro
-static void read_imu_baro_stub(float accel_mps2[3], float gyro_rad_s[3], float *baro_alt_m)
-{
-    accel_mps2[0] = 0.0f;
-    accel_mps2[1] = 0.0f;
-    accel_mps2[2] = 9.80665f;
-    gyro_rad_s[0] = 0.0f;
-    gyro_rad_s[1] = 0.0f;
-    gyro_rad_s[2] = 0.0f;
-    *baro_alt_m   = 0.0f;
-}
+static bool            s_adc_ready = false;
+static bool            s_lora_ready = false;
 
-static esp_err_t init_shared_spi_bus(void)
-{
-    // Tinem LoRa in HIGH ca sa nu incurce MISO cand vorbim cu ADC-ul
-    gpio_config_t cs_cfg = {
-        .pin_bit_mask = (1ULL << PIN_LORA_CS),
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE
-    };
-    ESP_ERROR_CHECK(gpio_config(&cs_cfg));
-    gpio_set_level(PIN_LORA_CS, 1);
+static flight_state_t  s_flight_state = STATE_PAD_IDLE;
+static int32_t         s_strain_raw[STRAIN_CHANNEL_COUNT] = {0};
+static float           s_accel_z_mps2 = 0.0f;
+static float           s_altitude_m = 0.0f;
+static float           s_vel_z_ms = 0.0f;
+static float           s_yaw_heading_deg = 0.0f;
+static bool            s_baro_locked_out = false;
+static gnss_data_t     s_gnss = {0};
 
-    spi_bus_config_t bus_cfg = {
-        .mosi_io_num = PIN_SPI_MOSI,
-        .miso_io_num = PIN_SPI_MISO,
-        .sclk_io_num = PIN_SPI_SCK,
-        .quadwp_io_num = -1,
-        .quadhd_io_num = -1,
-        .max_transfer_sz = 256
-    };
+static void lock_data(void)   { xSemaphoreTake(s_data_mutex, portMAX_DELAY); }
+static void unlock_data(void) { xSemaphoreGive(s_data_mutex); }
 
-    return spi_bus_initialize(SPI_HOST_USED, &bus_cfg, SPI_DMA_CH_AUTO);
-}
-
-static void flight_acq_task(void *arg)
+// Core 1: read sensors, run estimator + FSM, push a log record each loop.
+static void sensor_and_fsm_task(void *arg)
 {
     state_estimator_t est;
+    flight_fsm_t      fsm;
     state_estimator_init(&est);
+    flight_fsm_init(&fsm);
 
-    flight_state_t state = STATE_PAD_IDLE;
-    float accel[3], gyro[3], baro_alt = 0.0f;
-    int32_t strain_raw[STRAIN_CHANNEL_COUNT] = {0};
-
-    // Calibrare 2 secunde pe rampa (100 esantioane la 50 Hz)
-    ESP_LOGI(TAG, "Calibrare pe rampa (2s)...");
-    const uint16_t cal_samples = 100;
-    for (uint16_t i = 0; i < cal_samples; i++) {
-        read_imu_baro_stub(accel, gyro, &baro_alt);
-        state_estimator_calibrate_step(&est, gyro, baro_alt, i, cal_samples);
-        vTaskDelay(pdMS_TO_TICKS(LOOP_PERIOD_MS));
+    // Pad calibration: set ground = 0 m and the strain zero.
+    ESP_LOGI(TAG, "Calibrating on the pad (%d samples)...", FSM_CALIBRATION_SAMPLES);
+    for (uint16_t i = 0; i < FSM_CALIBRATION_SAMPLES; i++) {
+        imu_baro_data_t d = {0};
+        imu_baro_read(&d);
+        state_estimator_calibrate_step(&est, d.accel_mps2, d.gyro_dps,
+                                       d.mag_ut, d.mag_valid, d.altitude_m,
+                                       i, FSM_CALIBRATION_SAMPLES);
+        vTaskDelay(pdMS_TO_TICKS(SENSOR_LOOP_MS));
     }
 
-    // Aducem marcile tensometrice la 0 inainte de lansare
     if (s_adc_ready) {
         if (ads124s06_tare(32) != ESP_OK) {
-            ESP_LOGW(TAG, "Tare ADS124S06 esuat, ramanem pe offset 0");
+            ESP_LOGW(TAG, "Strain-gauge tare failed; using raw zero.");
         }
     }
+    ESP_LOGI(TAG, "Calibration done. Ready for launch (PAD_IDLE).");
 
-    ESP_LOGI(TAG, "Gata de lansare (PAD_IDLE). Bucla ruleaza la 50 Hz.");
-
+    TickType_t last_wake = xTaskGetTickCount();
     int64_t last_us = esp_timer_get_time();
-    uint32_t loop_counter = 0;
-    uint32_t landed_stable_ticks = 0;
-    TickType_t last_wake_time = xTaskGetTickCount();
+    uint32_t loop_count = 0;
+    static bool s_log_closed = false;
 
     while (1) {
-        vTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(LOOP_PERIOD_MS));
+        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(SENSOR_LOOP_MS));
 
         int64_t now_us = esp_timer_get_time();
-        float dt_s = (float)(now_us - last_us) * 1e-6f;
+        float    dt_s  = (float)(now_us - last_us) * 1e-6f;
+        uint32_t dt_ms = (uint32_t)((now_us - last_us) / 1000);
         last_us = now_us;
 
-        read_imu_baro_stub(accel, gyro, &baro_alt);
+        imu_baro_data_t sensors = {0};
+        imu_baro_read(&sensors);
 
+        int32_t strain[STRAIN_CHANNEL_COUNT] = {0};
         if (s_adc_ready) {
-            esp_err_t adc_ret = ads124s06_read_all_channels(strain_raw);
-            if (adc_ret != ESP_OK && (loop_counter % 50 == 0)) {
-                ESP_LOGW(TAG, "Eroare citire ADS124S06: %s", esp_err_to_name(adc_ret));
-            }
+            ads124s06_read_all_channels(strain);
         }
 
-        // Actualizam altitudinea si viteza (ignora automat baro in transonic)
-        state_estimator_update(&est, accel, gyro, baro_alt, dt_s);
+        state_estimator_update(&est, sensors.accel_mps2, sensors.gyro_dps,
+                               sensors.mag_ut, sensors.mag_valid,
+                               sensors.altitude_m, dt_s);
+        flight_state_t state = flight_fsm_update(&fsm, &est, dt_ms);
 
-        if (state == STATE_PAD_IDLE) {
-            // Peste 2.5g in sus inseamna ca a plecat de pe rampa
-            if (est.accel_z_world_mps2 > 24.5f) {
-                state = STATE_FLIGHT;
-                ESP_LOGI(TAG, "LAUNCH DETECTED! Intrare in STATE_FLIGHT");
-            }
-        } else if (state == STATE_FLIGHT) {
-            // Daca sta sub 15m cu viteza aproape 0 timp de 5s, a aterizat
-            if (est.alt_m < 15.0f && est.vel_z_mps > -1.0f && est.vel_z_mps < 1.0f) {
-                landed_stable_ticks++;
-                if (landed_stable_ticks >= 250) {
-                    state = STATE_LANDED;
-                    ESP_LOGI(TAG, "LANDING DETECTED! Inchidem fisierul FLIGHT.BIN...");
-                    sd_logger_close();
-                }
-            } else {
-                landed_stable_ticks = 0;
-            }
+        lock_data();
+        s_flight_state = state;
+        for (int i = 0; i < STRAIN_CHANNEL_COUNT; i++) {
+            s_strain_raw[i] = strain[i];
         }
+        s_accel_z_mps2    = est.accel_z_world_mps2;
+        s_altitude_m      = est.alt_m;
+        s_vel_z_ms        = est.vel_z_mps;
+        s_yaw_heading_deg = est.yaw_heading_deg;
+        s_baro_locked_out = est.is_baro_locked_out;
+        unlock_data();
 
-        // Bagam datele in ring buffer cat timp suntem inca in zbor/pe rampa
         if (state != STATE_LANDED) {
-            flight_log_record_t rec = {
-                .timestamp_us = (uint64_t)now_us,
-                .strain_ch    = { strain_raw[0], strain_raw[1], strain_raw[2] },
-                .flight_state = (uint8_t)state,
-                .reserved     = { 0, 0, 0 }
-            };
+            flight_log_record_t rec = {0};
+            rec.timestamp    = (uint64_t)now_us;
+            rec.strain_ch[0] = strain[0];
+            rec.strain_ch[1] = strain[1];
+            rec.strain_ch[2] = strain[2];
+            rec.accel_z_mps2 = est.accel_z_world_mps2;
+            rec.altitude_m   = est.alt_m;
+            rec.vel_z_ms          = est.vel_z_mps;
+            rec.yaw_heading_deg   = est.yaw_heading_deg;
+            rec.flight_state      = (uint8_t)state;
+            rec.is_baro_locked_out = est.is_baro_locked_out ? 1 : 0;
             sd_logger_push_record(&rec);
         }
 
-        // Print de status o data pe secunda
-        if (++loop_counter % 50 == 0) {
-            float ue0 = ads124s06_raw_to_microstrain(strain_raw[0], 64.0f, 2.05f, 1.0f);
-            ESP_LOGI(TAG, "State=%d | Alt=%.1fm | Vz=%.1fm/s | BaroLock=%d | CH0=%.1f uE | Drop=%lu",
-                     state, est.alt_m, est.vel_z_mps, est.baro_locked,
-                     ue0, (unsigned long)sd_logger_get_dropped_count());
+        if (state == STATE_LANDED && !s_log_closed) {
+            ESP_LOGI(TAG, "Landed. Flushing and closing the SD log.");
+            sd_logger_close();
+            s_log_closed = true;
+        }
+
+        if (++loop_count % 50 == 0) {
+            float mv0 = ads124s06_raw_to_millivolts(strain[0], ADC_GAIN_MULTIPLIER);
+            ESP_LOGI(TAG, "[%s] alt=%.1fm vz=%.1fm/s az=%.1fm/s2 hdg=%.0fdeg tilt=%.0fdeg baro_lock=%d SG0=%.3fmV dropped=%lu",
+                     flight_fsm_state_name(state), est.alt_m, est.vel_z_mps,
+                     est.accel_z_world_mps2, est.yaw_heading_deg, est.tilt_deg,
+                     est.is_baro_locked_out ? 1 : 0, mv0,
+                     (unsigned long)sd_logger_get_dropped_count());
         }
     }
+}
+
+// Core 0: build and transmit a telemetry packet; fast in flight, slow otherwise.
+static void lora_tx_task(void *arg)
+{
+    uint16_t counter = 0;
+
+    while (1) {
+        lock_data();
+        flight_state_t state = s_flight_state;
+        telemetry_packet_t pkt = {0};
+        pkt.flight_state = (uint8_t)state;
+        pkt.strain_raw[0] = s_strain_raw[0];
+        pkt.strain_raw[1] = s_strain_raw[1];
+        pkt.strain_raw[2] = s_strain_raw[2];
+        pkt.accel_z_mps2 = s_accel_z_mps2;
+        pkt.altitude_m   = s_altitude_m;
+        pkt.vel_z_ms           = s_vel_z_ms;
+        pkt.yaw_heading_deg    = s_yaw_heading_deg;
+        pkt.is_baro_locked_out = s_baro_locked_out ? 1 : 0;
+        pkt.latitude_deg  = s_gnss.latitude_deg;
+        pkt.longitude_deg = s_gnss.longitude_deg;
+        unlock_data();
+
+        pkt.packet_counter = counter++;
+        pkt.timestamp_ms = (uint32_t)(esp_timer_get_time() / 1000);
+
+        if (s_lora_ready) {
+            lora_send_packet(&pkt);
+        }
+
+        uint32_t period_ms;
+        if (state == STATE_PAD_IDLE || state == STATE_LANDED) {
+            period_ms = LORA_PERIOD_PAD_MS;
+        } else {
+            period_ms = LORA_PERIOD_FLIGHT_MS;
+        }
+        vTaskDelay(pdMS_TO_TICKS(period_ms));
+    }
+}
+
+// Core 0: read the GPS UART and publish the latest fix.
+static void gnss_task(void *arg)
+{
+    while (1) {
+        gnss_data_t fix;
+        if (gnss_read(&fix) == ESP_OK) {
+            lock_data();
+            s_gnss = fix;
+            unlock_data();
+        }
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+}
+
+// Wi-Fi/BT are never started, so both are already off; make it explicit.
+static void disable_wifi_and_bt(void)
+{
+    esp_wifi_stop();
+    esp_wifi_deinit();
+    ESP_LOGI(TAG, "Wi-Fi and Bluetooth left disabled (never started).");
 }
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "=== Boot Avionica 2SPACE (ESP32-S3) ===");
+    ESP_LOGI(TAG, "=== 2SPACE Avionics boot (ESP32-S3) ===");
 
-    if (sd_logger_init() != ESP_OK) {
-        ESP_LOGE(TAG, "Eroare critica: microSD neinitializat!");
+    esp_err_t nvs_ret = nvs_flash_init();
+    if (nvs_ret == ESP_ERR_NVS_NO_FREE_PAGES || nvs_ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        nvs_flash_erase();
+        nvs_flash_init();
     }
 
-    ESP_ERROR_CHECK(init_shared_spi_bus());
+    disable_wifi_and_bt();
 
-    if (ads124s06_init(SPI_HOST_USED, ADS124_GAIN_64) == ESP_OK) {
+    s_data_mutex = xSemaphoreCreateMutex();
+    if (s_data_mutex == NULL) {
+        ESP_LOGE(TAG, "Could not create data mutex. Halting.");
+        return;
+    }
+
+    ESP_LOGI(TAG, "Init: shared buses...");
+    if (bus_manager_init() != ESP_OK) {
+        ESP_LOGE(TAG, "Bus init failed. Halting.");
+        return;
+    }
+
+    ESP_LOGI(TAG, "Init: microSD logger...");
+    if (sd_logger_init() != ESP_OK) {
+        ESP_LOGE(TAG, "microSD not available (continuing without logging).");
+    }
+
+    ESP_LOGI(TAG, "Init: strain-gauge ADC (ADS124S06)...");
+    if (ads124s06_init(BOARD_SPI_HOST, ADC_GAIN_CODE) == ESP_OK) {
         s_adc_ready = true;
     } else {
-        ESP_LOGE(TAG, "Atentie: ADS124S06 nu raspunde pe SPI (continuam fara ADC)");
+        ESP_LOGE(TAG, "ADS124S06 not responding (continuing without strain).");
     }
 
-    // Task-ul principal de achizitie sta pe Core 1 (SD-ul scrie separat pe Core 0)
-    xTaskCreatePinnedToCore(
-        flight_acq_task,
-        "flight_acq",
-        6144,
-        NULL,
-        6,
-        NULL,
-        1
-    );
+    ESP_LOGI(TAG, "Init: IMU + barometer...");
+    if (imu_baro_init() == ESP_OK) {
+        imu_baro_set_ground_reference(20);
+    } else {
+        ESP_LOGE(TAG, "IMU/baro not responding (continuing anyway).");
+    }
+
+    ESP_LOGI(TAG, "Init: GNSS...");
+    gnss_init();
+
+    ESP_LOGI(TAG, "Init: LoRa radio...");
+    if (lora_init(BOARD_SPI_HOST) == ESP_OK) {
+        s_lora_ready = true;
+    } else {
+        ESP_LOGE(TAG, "LoRa not responding (continuing without telemetry).");
+    }
+
+    ESP_LOGI(TAG, "Starting tasks...");
+
+    // Core 1: time-critical sensor + state-machine loop.
+    xTaskCreatePinnedToCore(sensor_and_fsm_task, "sensor_fsm", 8192, NULL, 6, NULL, 1);
+
+    // Core 0: housekeeping (sd_writer also runs on core 0, started in sd_logger_init).
+    xTaskCreatePinnedToCore(lora_tx_task, "lora_tx", 4096, NULL, 4, NULL, 0);
+    xTaskCreatePinnedToCore(gnss_task,    "gnss",    4096, NULL, 3, NULL, 0);
+
+    ESP_LOGI(TAG, "=== Boot complete. System running. ===");
 }

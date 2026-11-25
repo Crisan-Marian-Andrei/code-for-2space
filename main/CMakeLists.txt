@@ -1,5 +1,8 @@
 idf_component_register(
     SRCS "main.c"
     INCLUDE_DIRS "."
-    REQUIRES driver esp_timer sd_logger strain_gauge flight_fsm board_bsp bus_manager
+    REQUIRES
+        board_bsp bus_manager strain_gauge imu_baro gnss lora_telemetry
+        sd_logger flight_fsm
+        esp_timer esp_wifi nvs_flash
 )

@@ -1,130 +1,118 @@
 #include "flight_fsm.h"
+
 #include <math.h>
-#include <string.h>
 
-#define G_ACCEL            9.80665f
-#define TRANSONIC_ENTER_V  265.0f   // ~Mach 0.78 (intrare in lockout baro)
-#define TRANSONIC_EXIT_V   255.0f   // Histerezis 10 m/s la iesire
-#define SUPERSONIC_EXIT_V  415.0f   // ~Mach 1.22 (peste zona de instabilitate transonica)
-
-void state_estimator_init(state_estimator_t *st)
+void flight_fsm_init(flight_fsm_t *fsm)
 {
-    memset(st, 0, sizeof(state_estimator_t));
-    st->qw = 1.0f;
+    fsm->current_state = STATE_PAD_IDLE;
+    fsm->peak_velocity_ms = 0.0f;
+    fsm->boost_hold_ms = 0;
+    fsm->apogee_hold_ms = 0;
+    fsm->landed_stable_ms = 0;
+    fsm->calibration_count = 0;
+    fsm->is_calibrated = false;
 }
 
-void state_estimator_calibrate_step(state_estimator_t *st,
-                                    const float gyro_rad_s[3],
-                                    float baro_alt_m,
-                                    uint16_t sample_idx,
-                                    uint16_t total_samples)
+// Human-readable name for a flight state (for logs/telemetry).
+const char *flight_fsm_state_name(flight_state_t state)
 {
-    if (sample_idx == 0) {
-        st->gyro_bias[0] = 0.0f;
-        st->gyro_bias[1] = 0.0f;
-        st->gyro_bias[2] = 0.0f;
-        st->baro_ground_alt_m = 0.0f;
-        st->is_calibrated = false;
-    }
-
-    st->gyro_bias[0] += gyro_rad_s[0];
-    st->gyro_bias[1] += gyro_rad_s[1];
-    st->gyro_bias[2] += gyro_rad_s[2];
-    st->baro_ground_alt_m += baro_alt_m;
-
-    if (sample_idx + 1 >= total_samples && total_samples > 0) {
-        float inv_n = 1.0f / (float)total_samples;
-        st->gyro_bias[0] *= inv_n;
-        st->gyro_bias[1] *= inv_n;
-        st->gyro_bias[2] *= inv_n;
-        st->baro_ground_alt_m *= inv_n;
-        st->alt_m = 0.0f;
-        st->vel_z_mps = 0.0f;
-        st->is_calibrated = true;
+    switch (state) {
+        case STATE_PAD_IDLE: return "PAD_IDLE";
+        case STATE_BOOST:    return "BOOST";
+        case STATE_COAST:    return "COAST";
+        case STATE_APOGEE:   return "APOGEE";
+        case STATE_DESCENT:  return "DESCENT";
+        case STATE_LANDED:   return "LANDED";
+        default:             return "UNKNOWN";
     }
 }
 
-void state_estimator_update(state_estimator_t *st,
-                            const float accel_mps2[3],
-                            const float gyro_rad_s[3],
-                            float baro_alt_m,
-                            float dt_s)
+// Advance the flight state machine one step and return the new state.
+// Transitions are driven by estimated vertical velocity (vel_z_mps) first,
+// with acceleration and altitude as supporting evidence.
+flight_state_t flight_fsm_update(flight_fsm_t *fsm,
+                                 const state_estimator_t *est,
+                                 uint32_t dt_ms)
 {
-    if (dt_s <= 0.0f || dt_s > 0.2f) {
-        return; // Protectie la dt invalid
+    // Pull the estimator outputs into plainly-named locals.
+    float vel_z_ms  = est->vel_z_mps;                                  // vertical speed (up = +)
+    float accel_z_g = (est->accel_z_world_mps2 + FSM_ONE_G_MPS2) / FSM_ONE_G_MPS2; // total felt accel in g
+
+    // Remember the fastest upward speed so far (used to confirm apogee).
+    if (vel_z_ms > fsm->peak_velocity_ms) {
+        fsm->peak_velocity_ms = vel_z_ms;
     }
 
-    /* 1. Scadem bias-ul giroscopului */
-    float gx = gyro_rad_s[0] - st->gyro_bias[0];
-    float gy = gyro_rad_s[1] - st->gyro_bias[1];
-    float gz = gyro_rad_s[2] - st->gyro_bias[2];
+    switch (fsm->current_state) {
 
-    /* 2. Integrare cuaternion 3D (q_dot = 0.5 * q (x) omega) */
-    float half_dt = 0.5f * dt_s;
-    float qw = st->qw;
-    float qx = st->qx;
-    float qy = st->qy;
-    float qz = st->qz;
-
-    st->qw += (-qx * gx - qy * gy - qz * gz) * half_dt;
-    st->qx += ( qw * gx + qy * gz - qz * gy) * half_dt;
-    st->qy += ( qw * gy - qx * gz + qz * gx) * half_dt;
-    st->qz += ( qw * gz + qx * gy - qy * gx) * half_dt;
-
-    /* Normalizare cuaternion (evita eroarea numerica in zbor) */
-    float norm = sqrtf(st->qw * st->qw + st->qx * st->qx +
-                       st->qy * st->qy + st->qz * st->qz);
-    if (norm > 1e-6f) {
-        float inv_norm = 1.0f / norm;
-        st->qw *= inv_norm;
-        st->qx *= inv_norm;
-        st->qy *= inv_norm;
-        st->qz *= inv_norm;
-    }
-
-    /* 3. Proiectia acceleratiei din sistemul rachetei (body) pe axa Z globala (randul 3 din DCM) */
-    float r31 = 2.0f * (st->qx * st->qz - st->qw * st->qy);
-    float r32 = 2.0f * (st->qy * st->qz + st->qw * st->qx);
-    float r33 = 1.0f - 2.0f * (st->qx * st->qx + st->qy * st->qy);
-
-    float az_world = r31 * accel_mps2[0] +
-                     r32 * accel_mps2[1] +
-                     r33 * accel_mps2[2] - G_ACCEL;
-
-    st->accel_z_world_mps2 = az_world;
-
-    /* Unghiul de inclinare fata de verticala (util in flight_fsm pentru siguranta) */
-    float clamped_r33 = (r33 > 1.0f) ? 1.0f : ((r33 < -1.0f) ? -1.0f : r33);
-    st->tilt_angle_rad = acosf(clamped_r33);
-
-    /* 4. Integrare trapezoidala pentru viteza si altitudine */
-    float prev_vel = st->vel_z_mps;
-    st->vel_z_mps += az_world * dt_s;
-    st->alt_m     += 0.5f * (prev_vel + st->vel_z_mps) * dt_s;
-
-    /* 5. Logica de lockout barometric in transonic (cu histerezis) */
-    float speed = fabsf(st->vel_z_mps);
-    if (!st->baro_locked) {
-        if (speed >= TRANSONIC_ENTER_V && speed <= SUPERSONIC_EXIT_V) {
-            st->baro_locked = true;
+    case STATE_PAD_IDLE:
+        // Wait out the calibration window before looking for launch.
+        if (!fsm->is_calibrated) {
+            fsm->calibration_count++;
+            if (fsm->calibration_count >= FSM_CALIBRATION_SAMPLES) {
+                fsm->is_calibrated = true;
+            }
+            break;
         }
-    } else {
-        if (speed < TRANSONIC_EXIT_V || speed > SUPERSONIC_EXIT_V) {
-            st->baro_locked = false;
+
+        // Launch: hard acceleration AND actually moving up, held for 100 ms.
+        // Requiring both avoids a false trigger from a bump or a hard knock.
+        if (accel_z_g > FSM_BOOST_ACCEL_G && vel_z_ms > FSM_BOOST_VEL_MS) {
+            fsm->boost_hold_ms += dt_ms;
+            if (fsm->boost_hold_ms >= FSM_BOOST_HOLD_MS) {
+                fsm->current_state = STATE_BOOST;
+            }
+        } else {
+            fsm->boost_hold_ms = 0;
         }
+        break;
+
+    case STATE_BOOST:
+        // Motor burnout: felt accel drops below 1.2 g while still climbing fast.
+        // (The barometer may be locked out here during the transonic push.)
+        if (accel_z_g < FSM_COAST_ACCEL_G && vel_z_ms > FSM_COAST_VEL_MS) {
+            fsm->current_state = STATE_COAST;
+        }
+        break;
+
+    case STATE_COAST:
+        // Apogee: upward speed has bled off to near zero. Velocity-driven, so
+        // it ignores any high-speed barometer spikes earlier in the flight.
+        if (vel_z_ms <= FSM_APOGEE_VEL_MS) {
+            fsm->apogee_hold_ms += dt_ms;
+            if (fsm->apogee_hold_ms >= FSM_APOGEE_HOLD_MS) {
+                fsm->current_state = STATE_APOGEE;
+            }
+        } else {
+            fsm->apogee_hold_ms = 0;   // still climbing, reset the timer
+        }
+        break;
+
+    case STATE_APOGEE:
+        // Brief marker at the top; arm the landed timer and move to descent.
+        fsm->landed_stable_ms = 0;
+        fsm->current_state = STATE_DESCENT;
+        break;
+
+    case STATE_DESCENT:
+        // Falling under parachute until we are nearly still for 5 seconds.
+        if (fabsf(vel_z_ms) < FSM_LANDED_VEL_MS) {
+            fsm->landed_stable_ms += dt_ms;
+            if (fsm->landed_stable_ms >= FSM_LANDED_STABLE_MS) {
+                fsm->current_state = STATE_LANDED;
+            }
+        } else {
+            fsm->landed_stable_ms = 0;   // still moving, reset the timer
+        }
+        break;
+
+    case STATE_LANDED:
+        break;
+
+    default:
+        fsm->current_state = STATE_PAD_IDLE;
+        break;
     }
 
-    if (st->baro_locked) {
-        return; // Ramane 100% pe integrala inertiala cat timp e in transonic
-    }
-
-    /* 6. Fuziune barometrica (AGL = fata de rampa) in afara zonei transonice */
-    float rel_baro_alt = baro_alt_m - st->baro_ground_alt_m;
-    float alt_error = rel_baro_alt - st->alt_m;
-
-    const float kp_alt = 0.25f;
-    const float kp_vel = 0.08f;
-
-    st->alt_m     += kp_alt * alt_error * dt_s;
-    st->vel_z_mps += kp_vel * alt_error * dt_s;
+    return fsm->current_state;
 }

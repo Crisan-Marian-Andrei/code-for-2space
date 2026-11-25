@@ -1,5 +1,5 @@
 idf_component_register(
     SRCS "sd_logger.c"
     INCLUDE_DIRS "include"
-    REQUIRES fatfs sdmmc driver esp_timer
+    REQUIRES fatfs sdmmc driver esp_timer board_bsp
 )
