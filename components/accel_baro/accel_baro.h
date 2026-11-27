@@ -55,7 +55,7 @@ extern "C" {
 //   SDO tied high -> 0x47
 // Set this to match the schematic. (Confirm from the netlist.)
 #ifndef BARO_I2C_ADDR
-#define BARO_I2C_ADDR         0x47
+#define BARO_I2C_ADDR         0x46
 #endif
 
 #define BARO_REG_CHIP_ID      0x01
