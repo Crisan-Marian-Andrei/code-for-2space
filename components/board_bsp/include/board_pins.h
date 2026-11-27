@@ -16,23 +16,21 @@ extern "C" {
 // Strain-gauge ADC (ADS124S06), SPI device 1
 #define PIN_SG_CS               14      // active LOW
 #define PIN_SG_DRDY             7       // data ready, active LOW
-#define PIN_SG_RESET            33      // active LOW
+// NOTE: The ADS124S06 RESET pin is NOT wired to the MCU on this board.
+// The chip is reset in software with the SPI RESET command (0x06) in the
+// driver. (GPIO33 does not exist on ESP32-S3-WROOM-1 anyway.)
 
 // LoRa radio (Ra-01H / SX1276), SPI device 2
 #define PIN_LORA_CS             10      // active LOW
 #define PIN_LORA_RST            5       // active LOW
 #define PIN_LORA_DIO0           6       // TxDone
 
-// I2C bus (I2C_NUM_0): IMU + barometer
+// I2C bus (I2C_NUM_0): accelerometer (KXTJ3-1057) + barometer (BMP581)
 #define PIN_I2C_SDA             8
 #define PIN_I2C_SCL             9
-#define PIN_IMU_INT1            15
-#define PIN_IMU_INT2            21
-
-// GNSS (UART_NUM_1)
-#define PIN_GNSS_UART_TX        17      // ESP TX -> GNSS RX
-#define PIN_GNSS_UART_RX        18      // ESP RX <- GNSS TX
-#define PIN_GNSS_RST            16
+// TODO: The KXTJ3-1057 has optional INT1/INT2 lines. The schematic block
+// diagram does not show them routed, so they are intentionally omitted here.
+// If the PCB wires them, add PIN_ACCEL_INT here and ask before assigning a GPIO.
 
 // microSD (SDMMC slot 1, 4-bit)
 #define PIN_SDMMC_CMD           35
@@ -41,17 +39,6 @@ extern "C" {
 #define PIN_SDMMC_D1            38
 #define PIN_SDMMC_D2            39
 #define PIN_SDMMC_D3            40
-
-// CAN / TWAI (unused on payload)
-#define PIN_TWAI_TX             41
-#define PIN_TWAI_RX             42
-
-// Analog sense + pyro (unused on payload)
-#define PIN_VBATT_SENSE         4       // ADC1_CH3
-#define PIN_PYRO1_SENSE         1
-#define PIN_PYRO2_SENSE         2
-#define PIN_IGNITE1             47
-#define PIN_IGNITE2             48
 
 // System (boot button, USB, debug UART0) - do not reuse
 #define PIN_BOOT_BTN            0       // strapping pin

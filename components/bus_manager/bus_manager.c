@@ -73,44 +73,13 @@ static esp_err_t init_i2c_bus(void)
     return ret;
 }
 
-static esp_err_t init_gnss_uart(void)
-{
-    const uart_config_t uart_cfg = {
-        .baud_rate = BOARD_GNSS_UART_BAUD,
-        .data_bits = UART_DATA_8_BITS,
-        .parity = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
-        .source_clk = UART_SCLK_DEFAULT,
-    };
-
-    esp_err_t ret = uart_driver_install(BOARD_GNSS_UART_PORT, 1024, 0, 0, NULL, 0);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "uart_driver_install failed: %s", esp_err_to_name(ret));
-        return ret;
-    }
-
-    ret = uart_param_config(BOARD_GNSS_UART_PORT, &uart_cfg);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "uart_param_config failed: %s", esp_err_to_name(ret));
-        return ret;
-    }
-
-    ret = uart_set_pin(BOARD_GNSS_UART_PORT, PIN_GNSS_UART_TX, PIN_GNSS_UART_RX,
-                       UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "uart_set_pin failed: %s", esp_err_to_name(ret));
-    }
-    return ret;
-}
-
 esp_err_t bus_manager_init(void)
 {
     if (s_initialized) {
         return ESP_OK;
     }
 
-    ESP_LOGI(TAG, "Initialising shared buses (SPI2, I2C0, UART1)...");
+    ESP_LOGI(TAG, "Initialising shared buses (SPI2, I2C0)...");
 
     s_spi_mutex = xSemaphoreCreateMutex();
     s_i2c_mutex = xSemaphoreCreateMutex();
@@ -128,9 +97,6 @@ esp_err_t bus_manager_init(void)
     if (ret != ESP_OK) return ret;
 
     ret = init_i2c_bus();
-    if (ret != ESP_OK) return ret;
-
-    ret = init_gnss_uart();
     if (ret != ESP_OK) return ret;
 
     s_initialized = true;

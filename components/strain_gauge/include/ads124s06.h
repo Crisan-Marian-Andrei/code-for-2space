@@ -14,6 +14,10 @@ extern "C" {
 
 #define STRAIN_CHANNEL_COUNT  3
 
+// START/SYNC pin strapping: on this board the ADS124S06 START/SYNC pin is tied
+// to GND, so the MCU triggers every conversion with the SPI START command
+// (0x08). The driver sends START, waits for DRDY low, then clocks out RDATA.
+
 // PGA gain codes (multiplies the bridge voltage before conversion).
 typedef enum {
     ADS124_GAIN_1   = 0x00,

@@ -65,7 +65,7 @@ typedef struct {
 void flight_fsm_init(flight_fsm_t *fsm);
 
 // Advance the machine. dt_ms = ms since the last call. Returns the new state.
-// Reads vertical velocity, altitude, vertical accel and tilt from the estimator.
+// Reads vertical velocity, altitude and vertical accel from the estimator.
 flight_state_t flight_fsm_update(flight_fsm_t *fsm,
                                  const state_estimator_t *est,
                                  uint32_t dt_ms);

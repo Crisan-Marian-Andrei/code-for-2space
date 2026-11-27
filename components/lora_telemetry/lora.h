@@ -21,10 +21,8 @@ typedef struct __attribute__((packed)) {
     float    accel_z_mps2;
     float    altitude_m;
     float    vel_z_ms;            // estimated vertical speed (up = +)
-    float    yaw_heading_deg;     // compass heading 0..360 deg
+    float    temperature_c;       // barometer temperature
     uint8_t  is_baro_locked_out;  // 1 = barometer frozen (high speed)
-    double   latitude_deg;
-    double   longitude_deg;
     uint16_t crc16;
 } telemetry_packet_t;
 

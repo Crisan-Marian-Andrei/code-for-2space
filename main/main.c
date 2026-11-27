@@ -14,8 +14,7 @@
 #include "board_pins.h"
 #include "bus_manager.h"
 #include "ads124s06.h"
-#include "imu_baro.h"
-#include "gnss.h"
+#include "accel_baro.h"
 #include "lora.h"
 #include "sd_logger.h"
 #include "state_estimator.h"
@@ -42,9 +41,9 @@ static int32_t         s_strain_raw[STRAIN_CHANNEL_COUNT] = {0};
 static float           s_accel_z_mps2 = 0.0f;
 static float           s_altitude_m = 0.0f;
 static float           s_vel_z_ms = 0.0f;
-static float           s_yaw_heading_deg = 0.0f;
+static float           s_pressure_pa = 0.0f;
+static float           s_temperature_c = 0.0f;
 static bool            s_baro_locked_out = false;
-static gnss_data_t     s_gnss = {0};
 
 static void lock_data(void)   { xSemaphoreTake(s_data_mutex, portMAX_DELAY); }
 static void unlock_data(void) { xSemaphoreGive(s_data_mutex); }
@@ -60,10 +59,9 @@ static void sensor_and_fsm_task(void *arg)
     // Pad calibration: set ground = 0 m and the strain zero.
     ESP_LOGI(TAG, "Calibrating on the pad (%d samples)...", FSM_CALIBRATION_SAMPLES);
     for (uint16_t i = 0; i < FSM_CALIBRATION_SAMPLES; i++) {
-        imu_baro_data_t d = {0};
-        imu_baro_read(&d);
-        state_estimator_calibrate_step(&est, d.accel_mps2, d.gyro_dps,
-                                       d.mag_ut, d.mag_valid, d.altitude_m,
+        accel_baro_data_t d = {0};
+        accel_baro_read(&d);
+        state_estimator_calibrate_step(&est, d.accel_mps2, d.altitude_m,
                                        i, FSM_CALIBRATION_SAMPLES);
         vTaskDelay(pdMS_TO_TICKS(SENSOR_LOOP_MS));
     }
@@ -88,17 +86,15 @@ static void sensor_and_fsm_task(void *arg)
         uint32_t dt_ms = (uint32_t)((now_us - last_us) / 1000);
         last_us = now_us;
 
-        imu_baro_data_t sensors = {0};
-        imu_baro_read(&sensors);
+        accel_baro_data_t sensors = {0};
+        accel_baro_read(&sensors);
 
         int32_t strain[STRAIN_CHANNEL_COUNT] = {0};
         if (s_adc_ready) {
             ads124s06_read_all_channels(strain);
         }
 
-        state_estimator_update(&est, sensors.accel_mps2, sensors.gyro_dps,
-                               sensors.mag_ut, sensors.mag_valid,
-                               sensors.altitude_m, dt_s);
+        state_estimator_update(&est, sensors.accel_mps2, sensors.altitude_m, dt_s);
         flight_state_t state = flight_fsm_update(&fsm, &est, dt_ms);
 
         lock_data();
@@ -109,7 +105,8 @@ static void sensor_and_fsm_task(void *arg)
         s_accel_z_mps2    = est.accel_z_world_mps2;
         s_altitude_m      = est.alt_m;
         s_vel_z_ms        = est.vel_z_mps;
-        s_yaw_heading_deg = est.yaw_heading_deg;
+        s_pressure_pa     = sensors.pressure_pa;
+        s_temperature_c   = sensors.temperature_c;
         s_baro_locked_out = est.is_baro_locked_out;
         unlock_data();
 
@@ -121,9 +118,10 @@ static void sensor_and_fsm_task(void *arg)
             rec.strain_ch[2] = strain[2];
             rec.accel_z_mps2 = est.accel_z_world_mps2;
             rec.altitude_m   = est.alt_m;
-            rec.vel_z_ms          = est.vel_z_mps;
-            rec.yaw_heading_deg   = est.yaw_heading_deg;
-            rec.flight_state      = (uint8_t)state;
+            rec.vel_z_ms           = est.vel_z_mps;
+            rec.pressure_pa        = sensors.pressure_pa;
+            rec.temperature_c      = sensors.temperature_c;
+            rec.flight_state       = (uint8_t)state;
             rec.is_baro_locked_out = est.is_baro_locked_out ? 1 : 0;
             sd_logger_push_record(&rec);
         }
@@ -136,9 +134,9 @@ static void sensor_and_fsm_task(void *arg)
 
         if (++loop_count % 50 == 0) {
             float mv0 = ads124s06_raw_to_millivolts(strain[0], ADC_GAIN_MULTIPLIER);
-            ESP_LOGI(TAG, "[%s] alt=%.1fm vz=%.1fm/s az=%.1fm/s2 hdg=%.0fdeg tilt=%.0fdeg baro_lock=%d SG0=%.3fmV dropped=%lu",
+            ESP_LOGI(TAG, "[%s] alt=%.1fm vz=%.1fm/s az=%.1fm/s2 P=%.0fPa T=%.1fC baro_lock=%d SG0=%.3fmV dropped=%lu",
                      flight_fsm_state_name(state), est.alt_m, est.vel_z_mps,
-                     est.accel_z_world_mps2, est.yaw_heading_deg, est.tilt_deg,
+                     est.accel_z_world_mps2, sensors.pressure_pa, sensors.temperature_c,
                      est.is_baro_locked_out ? 1 : 0, mv0,
                      (unsigned long)sd_logger_get_dropped_count());
         }
@@ -161,10 +159,8 @@ static void lora_tx_task(void *arg)
         pkt.accel_z_mps2 = s_accel_z_mps2;
         pkt.altitude_m   = s_altitude_m;
         pkt.vel_z_ms           = s_vel_z_ms;
-        pkt.yaw_heading_deg    = s_yaw_heading_deg;
+        pkt.temperature_c      = s_temperature_c;
         pkt.is_baro_locked_out = s_baro_locked_out ? 1 : 0;
-        pkt.latitude_deg  = s_gnss.latitude_deg;
-        pkt.longitude_deg = s_gnss.longitude_deg;
         unlock_data();
 
         pkt.packet_counter = counter++;
@@ -181,20 +177,6 @@ static void lora_tx_task(void *arg)
             period_ms = LORA_PERIOD_FLIGHT_MS;
         }
         vTaskDelay(pdMS_TO_TICKS(period_ms));
-    }
-}
-
-// Core 0: read the GPS UART and publish the latest fix.
-static void gnss_task(void *arg)
-{
-    while (1) {
-        gnss_data_t fix;
-        if (gnss_read(&fix) == ESP_OK) {
-            lock_data();
-            s_gnss = fix;
-            unlock_data();
-        }
-        vTaskDelay(pdMS_TO_TICKS(200));
     }
 }
 
@@ -242,15 +224,12 @@ void app_main(void)
         ESP_LOGE(TAG, "ADS124S06 not responding (continuing without strain).");
     }
 
-    ESP_LOGI(TAG, "Init: IMU + barometer...");
-    if (imu_baro_init() == ESP_OK) {
-        imu_baro_set_ground_reference(20);
-    } else {
-        ESP_LOGE(TAG, "IMU/baro not responding (continuing anyway).");
+    ESP_LOGI(TAG, "Init: accelerometer + barometer...");
+    if (accel_baro_init() != ESP_OK) {
+        ESP_LOGE(TAG, "Accelerometer/barometer chip-ID check failed. Halting.");
+        return;
     }
-
-    ESP_LOGI(TAG, "Init: GNSS...");
-    gnss_init();
+    accel_baro_set_ground_reference(20);
 
     ESP_LOGI(TAG, "Init: LoRa radio...");
     if (lora_init(BOARD_SPI_HOST) == ESP_OK) {
@@ -266,7 +245,6 @@ void app_main(void)
 
     // Core 0: housekeeping (sd_writer also runs on core 0, started in sd_logger_init).
     xTaskCreatePinnedToCore(lora_tx_task, "lora_tx", 4096, NULL, 4, NULL, 0);
-    xTaskCreatePinnedToCore(gnss_task,    "gnss",    4096, NULL, 3, NULL, 0);
 
     ESP_LOGI(TAG, "=== Boot complete. System running. ===");
 }

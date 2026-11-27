@@ -1,0 +1,17 @@
+# 2SPACE avionics board defaults. See README.md for the hardware audit.
+# Board: ESP32-S3-WROOM-1-N16 (16 MB flash, NO PSRAM).
+
+CONFIG_IDF_TARGET="esp32s3"
+
+# 16 MB flash (N16 variant).
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
+
+# No PSRAM on this part. This is what frees GPIO35-40 for the SDMMC card.
+# CONFIG_SPIRAM is not set
+
+# Bluetooth stays off (never used; avoids RF interference with LoRa).
+# CONFIG_BT_ENABLED is not set
+
+# Long filenames on FATFS so FLIGHTnn.BIN names are safe on the SD card.
+CONFIG_FATFS_LFN_STACK=y

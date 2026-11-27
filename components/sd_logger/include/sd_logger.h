@@ -20,7 +20,8 @@ typedef struct __attribute__((packed)) {
     float    accel_z_mps2;
     float    altitude_m;
     float    vel_z_ms;            // estimated vertical speed (up = +)
-    float    yaw_heading_deg;     // compass heading 0..360 deg
+    float    pressure_pa;         // barometer pressure
+    float    temperature_c;       // barometer temperature
     uint8_t  flight_state;
     uint8_t  is_baro_locked_out;  // 1 = barometer frozen (high speed)
     uint8_t  reserved[2];

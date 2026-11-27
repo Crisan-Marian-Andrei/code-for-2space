@@ -103,21 +103,8 @@ esp_err_t ads124s06_init(spi_host_device_t spi_host, ads124_gain_t gain)
     esp_err_t ret = gpio_config(&drdy_cfg);
     if (ret != ESP_OK) return ret;
 
-    gpio_config_t rst_cfg = {
-        .pin_bit_mask = (1ULL << PIN_SG_RESET),
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    ret = gpio_config(&rst_cfg);
-    if (ret != ESP_OK) return ret;
-
-    // Hardware reset, then wait for the internal oscillator to settle.
-    gpio_set_level(PIN_SG_RESET, 0);
-    vTaskDelay(pdMS_TO_TICKS(5));
-    gpio_set_level(PIN_SG_RESET, 1);
-    vTaskDelay(pdMS_TO_TICKS(10));
+    // No MCU reset line on this board: the ADS124S06 RESET pin is not wired to
+    // a GPIO. We reset it in software with the SPI RESET command (0x06) below.
 
     spi_device_interface_config_t dev_cfg = {
         .clock_speed_hz = 4 * 1000 * 1000,
@@ -135,6 +122,9 @@ esp_err_t ads124s06_init(spi_host_device_t spi_host, ads124_gain_t gain)
 
     bus_lock_spi();
 
+    // Software reset over SPI, then wait before the first register access.
+    // The datasheet requires >= 4096 t_CLK (~1 ms at the 4.096 MHz internal
+    // oscillator) after RESET; 5 ms gives ample margin.
     send_command(CMD_RESET);
     vTaskDelay(pdMS_TO_TICKS(5));
 
@@ -179,6 +169,8 @@ static esp_err_t read_one_channel_locked(uint8_t channel_idx, int32_t *raw_out)
     ret = write_reg(REG_INPMUX, s_channel_mux[channel_idx]);
     if (ret != ESP_OK) return ret;
 
+    // START/SYNC is tied low: the MCU triggers each conversion with the SPI
+    // START command, then waits for DRDY to fall.
     ret = send_command(CMD_START);
     if (ret != ESP_OK) return ret;
 
